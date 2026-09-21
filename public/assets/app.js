@@ -72,11 +72,17 @@ const state = {
   /** 发布配置（来自 site-config，不在 /api/feed 里，所以单独存） */
   upload: null,
   /**
-   * 会话状态：{ authRequired, configured, user }，来自 GET /api/session。
+   * 会话状态：{ authRequired, readScope, configured, user }，来自 GET /api/session。
    * 只问"我是谁"，拿不到就当匿名 —— 不往页面里烘任何身份，静态导出也就不用脱敏。
    * null 表示还没问到（或压根没后端，比如静态导出）。
    */
   session: null,
+  /**
+   * 注入在 index.html 里的 auth.scope 有效值（'latest' / 'all' / 'upload'）。
+   * 只在 /api/session 还没回来（或压根没后端）时用作回落 ——
+   * 前端据此只是为了少发一个注定 401 的请求，真正的拦截在服务端。
+   */
+  readScope: 'upload',
   /** 刚发完动态时短暂静音 SSE，免得被 fs.watch 的第二次广播再刷一遍 */
   muteLiveUntil: 0,
   entries: [],
@@ -162,24 +168,47 @@ function toast(text, action) {
 
 /* ────────────────────────────── 加载数据 ────────────────────────────── */
 
+/**
+ * 「后端在，但明确拒绝了」的状态码：没登录、没权限、没配好。
+ * 这类响应**不能**回落到构建产物里的 feed.json —— 那等于拿一份打包好的旧数据
+ * 绕过鉴权，看起来还一切正常。
+ * 反过来 404 是"压根没有后端"（静态导出），必须继续走回落。
+ */
+const FEED_DENIED = (s) => s === 401 || s === 403 || s === 503;
+
+/**
+ * 拉扫描结果。失败时把 HTTP 状态码与错误码带到 Error 上 ——
+ * 调用方要靠 status === 401 区分"没登录/看不到"和"服务坏了"，
+ * 只看 message 会在文案改动时静默失效。
+ */
 async function fetchFeed(refresh = false) {
   const urls = refresh ? ['/api/feed?refresh=1', '/api/feed'] : ['/api/feed'];
   let lastErr = null;
   for (const url of urls) {
     try {
       const res = await fetch(url, { headers: { accept: 'application/json' } });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        const err = new Error(body?.error || `HTTP ${res.status}`);
+        err.status = res.status;
+        err.code = body?.code || '';
+        throw err;
+      }
       return await res.json();
     } catch (err) {
       lastErr = err;
+      // 被明确拒绝时别再撞第二个地址（同一件事，结果一样）
+      if (FEED_DENIED(err.status)) break;
     }
   }
-  // 静态导出场景没有接口，回落到构建产物里的 feed.json
-  try {
-    const res = await fetch('./feed.json');
-    if (res.ok) return await res.json();
-  } catch {
-    /* 继续抛原始错误 */
+  // 静态导出场景没有接口（/api/feed 会 404），回落到构建产物里的 feed.json
+  if (!FEED_DENIED(lastErr?.status)) {
+    try {
+      const res = await fetch('./feed.json');
+      if (res.ok) return await res.json();
+    } catch {
+      /* 继续抛原始错误 */
+    }
   }
   throw lastErr || new Error('加载失败');
 }
@@ -764,6 +793,34 @@ function renderNotices() {
   const warnings = state.data?.warnings || [];
   const blocks = [];
 
+  // 未登录 + 服务端只放开了最新几条：明说"你看到的是不全的"。
+  // 不说的话，用户会以为"我家就这一条动态"，然后开始怀疑照片丢了。
+  // 判据用服务端给的 preview.limited（它知道到底裁没裁），不是前端自己猜。
+  if (previewTruncated()) {
+    blocks.push(
+      h(
+        'div',
+        { class: 'notice' },
+        icon('lock'),
+        h(
+          'div',
+          { class: 'notice__body' },
+          h('p', { class: 'notice__title', text: '只显示了最新的一条' }),
+          h('p', { text: '登录后可以看到全部动态与照片。' }),
+          h(
+            'button',
+            {
+              class: 'btn btn--primary notice__cta',
+              type: 'button',
+              onclick: () => openLogin('登录后可以看全部'),
+            },
+            '登录查看全部',
+          ),
+        ),
+      ),
+    );
+  }
+
   if (state.data && state.data.ok === false) {
     blocks.push(
       h(
@@ -1023,14 +1080,28 @@ function initMenus() {
   });
 }
 
-/* ────────────────────────────── 登录 ────────────────────────────── */
+/* ─────────────────────────── 登录 / 访问门禁 ─────────────────────────── */
 /*
- * 账号认证只拦"写"这一步：看照片始终匿名可读。
+ * 服务端按 auth.scope 决定未登录能读到什么（默认 'latest'：只见最新几条）：
+ *   'latest' → feed 里只有最新那几条，媒体地址也只放行那几条；登录后才是全部
+ *   'all'    → 一律 401，页面直接铺一屏登录，内容压根不加载
+ *   'upload' → 读侧全放开，只有发布要登录
+ *
+ * 这里只做两件事：把状态显示对、该弹的登录框弹出来。
+ * 真正的拦截在服务端 —— 前端"藏起来"没有任何意义，抓个包就绕过去了。
+ *
  * 会话是服务端签名的 Cookie（HttpOnly），前端读不到也不需要读 ——
  * 每次开屏问一次 GET /api/session 拿"我是谁"，页面里不烘身份。
  */
 
-const auth = { busy: false };
+const auth = { busy: false, fromGate: false };
+
+/** 登录面板的开场白随访问范围而变：说错了会让人以为"登录就能看全部"，结果本来就是全部 */
+const AUTH_LEAD = {
+  all: '这个相册需要登录才能查看。',
+  latest: '登录后可以看到全部动态，现在只放开了最新的一条。',
+  upload: '看照片不用登录，只有往照片库里发布时才需要。',
+};
 
 async function fetchSession() {
   try {
@@ -1044,30 +1115,46 @@ async function fetchSession() {
 }
 
 /**
- * 当前是否必须先登录才能发布。
- *
+ * 当前读侧范围。优先信服务端（/api/session），其次信注入的配置。
+ * 两边都拿不到时按最松的 'upload' 处理：**前端不是防线**，
+ * 真被限制的话 /api/feed 会回 401，那条路会把人送进门禁（见 load 的 401 分支）。
+ * 反过来若在这里保守地猜"要登录"，静态导出（没有后端）就会莫名其妙弹一个永远登不上的框。
+ */
+function readScope() {
+  return state.session?.readScope || state.readScope || 'upload';
+}
+
+const isAnon = () => !state.session?.user;
+/** 整站锁：未登录时连内容都不该加载（连"有几条动态"都不给看） */
+const gateActive = () => isAnon() && readScope() === 'all';
+/** 服务端这次是否真的裁掉了东西（由 feed 载荷里的 preview.limited 说了算） */
+const previewTruncated = () => isAnon() && state.data?.preview?.limited === true;
+
+/**
+ * 未登录时"发布"要不要先登录。
  * 拿不到 /api/session 时**回落到配置里的 authRequired**，而不是默认"不用登录"：
  * 会话接口刚好抽风时，宁可多弹一次登录框，也不能把发布按钮亮出来让用户白填一遍表单。
  * （后端对"配了认证但没配账号"也是同样态度 —— 直接 503，不静默放行。）
  */
-function needsLogin() {
-  const s = state.session;
-  const required = s ? !!s.authRequired : !!state.upload?.authRequired;
-  return required && !s?.user;
+function needsLoginForWrite() {
+  if (!state.upload?.enabled) return false;
+  const required = state.session ? !!state.session.authRequired : !!state.upload?.authRequired;
+  return required && isAnon();
 }
 
-/** 顶栏上「登录 / 发布」互斥：没登录只看到登录，登录后只看到发布 */
+/** 未登录时"看"要不要先登录 */
+const needsLoginForRead = () => isAnon() && readScope() !== 'upload';
+
+/**
+ * 顶栏「登录 / 发布」互斥：没登录只看到登录（读或写任一被拦就要能登），登录后只看到发布。
+ * 门禁铺开时两个都收起来 —— 登录框已经占着整屏了，再给个「登录」按钮只是重复。
+ */
 function renderAuthUI() {
   const btnAuth = $('#open-auth');
   const btnPub = $('#open-publish');
-  if (!state.upload?.enabled) {
-    btnAuth.hidden = true;
-    btnPub.hidden = true;
-    return;
-  }
-  const login = needsLogin();
-  btnAuth.hidden = !login;
-  btnPub.hidden = login;
+  const locked = gateActive();
+  btnAuth.hidden = locked || !(needsLoginForRead() || needsLoginForWrite());
+  btnPub.hidden = locked || !state.upload?.enabled || needsLoginForWrite();
 }
 
 function setAuthNote(text, kind = '') {
@@ -1098,9 +1185,25 @@ function toggleReveal() {
   input.focus();
 }
 
-function openLogin(reason = '') {
+/**
+ * 打开登录面板。
+ *
+ * forced=true 是"整站锁"形态：面板已经开着就不再重置输入框（用户可能正打到一半），
+ * 并收起「取消 / 关闭」—— 关掉之后页面是空的，只会让人一脸茫然。
+ * 此时遮罩与 Esc 也会被 closeLogin 挡掉，所以用户只有一个出口：登录成功。
+ */
+function openLogin(reason = '', { forced = false } = {}) {
   const box = $('#login');
-  if (!box.hidden) return;
+  const alreadyOpen = !box.hidden;
+  auth.fromGate = forced;
+  box.classList.toggle('is-forced', forced);
+  $('#auth-close').hidden = forced;
+  $('#auth-cancel').hidden = forced;
+  $('#auth-lead').textContent = AUTH_LEAD[readScope()] || AUTH_LEAD.upload;
+  if (alreadyOpen) {
+    if (reason) setAuthNote(reason);
+    return;
+  }
   setAuthBusy(false);
   $('#auth-pass').value = '';
   $('#auth-pass').type = 'password';
@@ -1118,6 +1221,8 @@ function openLogin(reason = '') {
 function closeLogin() {
   const box = $('#login');
   if (box.hidden || auth.busy) return;
+  // 门禁形态没有"取消"：关掉之后页面是空的，用户只会一脸茫然
+  if (auth.fromGate) return;
   box.hidden = true;
   lockScroll(false);
   $('#open-auth')?.focus();
@@ -1164,15 +1269,24 @@ async function submitLogin() {
     return;
   }
 
-  // 登录成功：服务端已经种下 Cookie，本地只需记住"我是谁"
+  // 登录成功：服务端已经种下 Cookie，本地只需记住"我是谁"。
+  // readScope 靠展开保留 —— 登录接口不回这个字段。
   state.session = { ...(state.session || {}), configured: true, authRequired: true, user: body.user };
+  const wasGate = auth.fromGate;
+  auth.fromGate = false;
   setAuthBusy(false);
   closeLogin();
   renderAuthUI();
   toast(`已登录 · ${body.user?.name || body.user?.id || ''}`);
 
-  // 两条来源不同：① 用户主动点「登录」→ 顺手把发布面板打开，省一次点击；
-  //                ② 上传途中会话过期被弹回来 → 把刚才那批文件原样接上，别让用户重选。
+  // 三条来源，处理方式不同：
+  //   ① 整站锁弹的框 → 用户是冲着"看"来的，把内容拉出来就行，别把发布面板怼到脸上
+  //   ② 上传途中会话过期被弹回来 → 把刚才那批文件原样接上，别让用户重选
+  //   ③ 用户主动点「登录」→ 顺手把发布面板打开，省一次点击
+  if (wasGate) {
+    await reloadForAccess();
+    return;
+  }
   if (pub.afterLogin) {
     pub.afterLogin = false;
     openPublish({ fresh: false });
@@ -1193,10 +1307,76 @@ async function doLogout() {
   closePublish();
   renderAuthUI();
   toast('已退出登录');
+  // 可见范围是服务端说了算：退出去之后可能只剩最新一条（甚至一条都没有），
+  // 必须重新拉一次 —— 不能把上一个身份看到的照片继续留在屏幕上。
+  await reloadForAccess();
+}
+
+/* ── 访问范围变化后的重新对齐 ── */
+
+let live = null;
+
+function stopLive() {
+  live?.close();
+  live = null;
+}
+
+/**
+ * 整站锁：未登录时连内容都不该出现。
+ *
+ * 只把登录框盖上去是不够的 —— 那样 DOM 里还留着上一个人的照片，
+ * 截图、右键、"查看网页源代码"都能捞出来。所以这里真的把内容清掉，
+ * 再用 body.is-gated 把整块照片区域收起来（登录成功后 applyData 会摘掉这个类）。
+ */
+function renderGate(reason = '') {
+  stopLive();
+  closeLightbox();
+  state.data = null;
+  state.entries = [];
+  state.rendered = 0;
+  state.pending = null;
+  $('#feed')?.replaceChildren();
+  $('#notice')?.remove();
+  $('#meta-line')?.replaceChildren();
+  document.body.classList.add('is-gated');
+  openLogin(reason || AUTH_LEAD.all, { forced: true });
+}
+
+let resyncing = false;
+
+/**
+ * 身份变了（登录 / 退出 / 会话过期 / 服务端把范围改严了）之后重新对齐一次。
+ * 可见范围由服务端决定，前端只能重新问、重新拉。
+ *
+ * 返回 true 表示"已经处理过了，调用方不用再做别的"。
+ *
+ * resyncing 是防重入闸门：load() 自己也会在 401 时回到这里，
+ * 没有它就会绕成"拉 → 401 → 重问 → 再拉"的死循环。
+ * 重入被挡掉时返回 false，让调用方**继续往下走**（去 renderError 报错），
+ * 否则页面会永远停在骨架屏上 —— 既不重拉也不报错，看起来像卡死了。
+ */
+async function reloadForAccess(reason = '') {
+  if (resyncing) return false;
+  resyncing = true;
+  try {
+    const s = await fetchSession();
+    if (s) state.session = s;
+    renderAuthUI();
+    if (gateActive()) {
+      renderGate(reason);
+      return true;
+    }
+    document.body.classList.remove('is-gated');
+    // 只重试这一次：再被拒就直接显示错误，别绕成死循环
+    await load({ retryOnDenied: false });
+    initLive();
+    return true;
+  } finally {
+    resyncing = false;
+  }
 }
 
 function initAuth() {
-  const cfg = state.upload;
   $('#open-auth').addEventListener('click', () => openLogin());
   $('#auth-close').addEventListener('click', closeLogin);
   $('#auth-cancel').addEventListener('click', closeLogin);
@@ -1213,11 +1393,13 @@ function initAuth() {
     if (e.key === 'Escape') closeLogin();
   });
 
-  if (!cfg?.enabled) return;
-  // 会话状态要等接口回来才知道，先按配置把按钮摆好（错的那一侧也只是短暂出现）
+  // 会话状态要等接口回来才知道，先按配置把按钮摆好（错的那一侧也只是短暂出现）。
+  //
+  // 注意这里不再看 upload.enabled 提前 return：读侧也可能被拦
+  // （scope='all' 时即便关掉了上传，整站仍然要登录），跳过就等于把门开着。
   renderAuthUI();
   return fetchSession().then((s) => {
-    state.session = s;
+    if (s) state.session = s;
     renderAuthUI();
   });
 }
@@ -1412,8 +1594,10 @@ function setBar(ratio) {
 function openPublish({ fresh = true } = {}) {
   const box = $('#publish');
   if (!box.hidden || !state.upload?.enabled) return;
-  // 没登录就先登录，登录成功后 submitLogin 会替我们把这一步接着做完
-  if (needsLogin()) {
+  // 没登录就先登录，登录成功后 submitLogin 会替我们把这一步接着做完。
+  // 注意用的是"写"那一侧判断：读侧被拦（scope='all'）时门禁面板已经占着屏幕了，
+  // 发布面板根本打不开，不该在这里再叠加一层。
+  if (needsLoginForWrite()) {
     openLogin('先登录，再发布');
     return;
   }
@@ -1672,9 +1856,14 @@ function initInfiniteScroll() {
 /* ────────────────────────────── 目录监听 ────────────────────────────── */
 
 function initLive() {
-  if (!('EventSource' in window)) return;
+  // 门禁还开着就别连：注定 401，而且 EventSource 会一直重连，日志里刷一片。
+  // 注意 'latest' 档也算 —— 服务端对未登录的 SSE 一律拒绝（免得从推送时间推断作息），
+  // 所以判断条件是"未登录 + 读侧被限制"，不是仅仅 gateActive()。
+  if (live || !('EventSource' in window)) return;
+  if (isAnon() && readScope() !== 'upload') return;
   let timer = null;
   const es = new EventSource('/api/events');
+  live = es;
   es.addEventListener('change', () => {
     clearTimeout(timer);
     timer = setTimeout(async () => {
@@ -1699,8 +1888,11 @@ function initLive() {
             window.scrollTo({ top: 0, behavior: 'smooth' });
           },
         });
-      } catch {
-        /* 目录正在被写入，下次事件再试 */
+      } catch (err) {
+        // 401 别静默吞掉：页面会一直停在旧数据上，
+        // 用户只知道"新发的动态没出现"，完全看不出是身份掉了。
+        if (err.status === 401 || err.status === 403) await reloadForAccess();
+        /* 其余情况多半是目录正在被写入，下次事件再试 */
       }
     }, 500);
   });
@@ -1709,6 +1901,8 @@ function initLive() {
 /* ────────────────────────────── 主流程 ────────────────────────────── */
 
 function applyData(data) {
+  // 数据都拿到了，说明门禁已经放开 —— 把被收起的内容区域放回来
+  document.body.classList.remove('is-gated');
   state.data = data;
   state.pending = null;
   state.site = data.site || {};
@@ -1729,14 +1923,26 @@ function initConfigBootstrap() {
   }
 }
 
-async function load() {
+/**
+ * @param retryOnDenied 收到 401/403 时要不要先重新对齐身份再重试一次。
+ *   reloadForAccess() 内部调用时传 false（它自己就是那次重试），
+ *   否则会变成"重试里再重试"的递归。
+ */
+async function load({ retryOnDenied = true } = {}) {
   renderSkeleton();
+  let data;
   try {
-    const data = await fetchFeed();
-    applyData(data);
+    data = await fetchFeed();
   } catch (err) {
+    // 401/403：服务端已经不认这个身份了（会话过期 / 在别处退出了 / 范围被改严了）。
+    // 重新问一次"我是谁"，再按新的范围决定是铺门禁还是重拉 —— 别当"网络错误"处理。
+    if (retryOnDenied && (err.status === 401 || err.status === 403)) {
+      if (await reloadForAccess('登录状态已过期，重新登录后就能看到全部内容')) return;
+    }
     renderError(err);
+    return;
   }
+  applyData(data);
 }
 
 async function init() {
@@ -1759,6 +1965,7 @@ async function init() {
     state.batch = boot.feed?.pageSize || 24;
     // upload 只在 site-config 里，applyData 赋值 data.site 时不会带上它，得单独存
     state.upload = boot.upload || null;
+    state.readScope = boot.readScope || 'upload';
     // 筛选状态要在首次渲染前恢复，否则会白渲染一遍再重排
     restoreFilter(state.kids);
     renderCover();
@@ -1775,6 +1982,13 @@ async function init() {
     renderFilters();
     resetFeed();
   });
+
+  // 整站锁：连 feed 都不必去拉（注定 401），直接铺门禁。
+  // 也就顺带不建立 SSE、不请求任何缩略图 —— 未登录访客的网络面板应该是干净的。
+  if (gateActive()) {
+    renderGate();
+    return;
+  }
 
   await load();
 

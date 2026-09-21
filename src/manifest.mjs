@@ -13,14 +13,29 @@ import { encodeRelPath, ageAt } from './util.mjs';
  * authRequired 只说明「上传需要登录」这件事本身，不代表当前用户已登录 ——
  * 当前身份是每人一份的，得由 /api/session 现场问，不能烘进页面里
  * （否则多人共用浏览器或页面被缓存时会串号）。
+ *
+ * readScope 是同一件事在读侧的说法（'latest' / 'all' / 'upload'）。它烘进页面是安全的：
+ * 它不是"谁"的信息，而是"这个服务怎么配置的"。前端拿它只为了少发一个注定 401 的请求；
+ * 真裁剪在服务端 —— 未登录时 /api/feed 里根本没有那些条目。
+ *
+ * redactKids：未登录时把宝宝的**生日与别名**摘掉。页面骨架必须公开
+ * （不然登录界面自己都加载不出来，assets 里的 css/js 也拿不到），
+ * 但没有任何理由把孩子的确切生日送到一个匿名访客的浏览器里。
+ * 名字留着 —— 预览那几条动态本来就会显示它，藏了反而前后不一致。
  */
-export function siteConfig(config, { uploadEnabled = true, authRequired = false } = {}) {
+export function siteConfig(
+  config,
+  { uploadEnabled = true, authRequired = false, readScope = 'upload', redactKids = false } = {},
+) {
   const up = config.upload || {};
   const enabled = uploadEnabled && up.enabled !== false;
   return {
     ...config.site,
-    kids: config.kids,
+    kids: redactKids
+      ? (config.kids || []).map((k) => ({ id: k.id, name: k.name, avatar: null }))
+      : config.kids,
     feed: config.feed,
+    readScope,
     upload: {
       enabled,
       authRequired: enabled && authRequired,

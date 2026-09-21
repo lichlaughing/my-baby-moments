@@ -124,6 +124,17 @@
   box-sizing: border-box;
 }
 
+/* `hidden` 属性必须压得住自定义 display。
+   UA 样式表里那条 `[hidden] { display: none }` 的优先级是 (0,1,0)，
+   而 `.btn` / `.iconbtn` / `.picked` 这些类都显式写了 `display: inline-flex` ——
+   类选择器同样 (0,1,0) 但排在作者样式里，于是**属性被静默无视**，
+   按钮/区块照旧显示，而 JS 那边看起来毫无问题。
+   补一条 !important 一劳永逸：本文件里所有 [hidden] 的用法（含下面那些
+   .xx[hidden] 单独规则）意图都是"藏起来"，不存在需要"带 hidden 但可见"的元素。 */
+[hidden] {
+  display: none !important;
+}
+
 html {
   -webkit-text-size-adjust: 100%;
   scroll-behavior: smooth;
@@ -1193,6 +1204,12 @@ body.has-js .moment.is-in {
   color: var(--ink);
 }
 
+/* 提示块里的行动按钮（例如"只显示了最新的一条 → 登录查看全部"）。
+   提示块的正文是 <p>，按钮要自己带一点上边距，否则会贴着最后一行。 */
+.notice__cta {
+  margin-top: 12px;
+}
+
 .notice__list {
   margin: 6px 0 0;
   padding-left: 18px;
@@ -1932,6 +1949,16 @@ kbd {
 .auth__lead strong {
   font-weight: 600;
   color: var(--ink);
+}
+
+/* 整站锁（auth.scope = 'all' 且未登录）：把"照片"相关的区域整体收起来。
+   不是盖一层遮罩就完事 —— 遮罩之下 DOM 里还留着内容，
+   截图、右键、看网页源代码都能捞出来。登录成功后 applyData 会摘掉这个类。 */
+body.is-gated .cover,
+body.is-gated .page,
+body.is-gated .footer,
+body.is-gated .totop {
+  display: none;
 }
 
 /* 发布面板底部的「以 X 的身份发布 · 退出」 */

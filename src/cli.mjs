@@ -16,6 +16,7 @@ import { execFile } from 'node:child_process';
 import { createServer } from './server.mjs';
 import { createScanner } from './scan.mjs';
 import { createThumbs } from './thumbs.mjs';
+import { resolveReadScope } from './auth.mjs';
 import { decorateManifest, siteConfig, toScriptJson } from './manifest.mjs';
 import { humanSize } from './util.mjs';
 
@@ -103,16 +104,21 @@ async function cmdServe(args) {
   console.log(`  ${c.bold(config.site.title)}  ${c.dim('· 本地预览')}`);
   console.log(`  ${c.cyan(url)}`);
   console.log(`  ${c.dim('照片库')} ${app.scanner.mediaRoot}`);
+  console.log(`  ${c.dim('访问范围')} ${app.auth.describeRead()}`);
   console.log(`  ${c.dim('上传账号')} ${app.auth.describe()}`);
   console.log('');
 
-  // 开了认证却没配账号时，上传是会被挡住的。这是刻意为之（静默放行更危险），
+  // 开了认证却没配账号时，请求会被挡住。这是刻意为之（静默放行更危险），
   // 所以必须把"怎么修"当场说清楚，别让人去翻源码。
   if (app.auth.misconfigured) {
-    console.log(c.yellow('  ⚠ 上传认证已开启，但一个账号都没有 —— 现在谁也传不了。'));
+    console.log(
+      c.yellow(
+        `  ⚠ 账号认证已开启，但一个账号都没有 —— 现在${app.auth.readsGated ? '整站都进不去' : '谁也传不了'}。`,
+      ),
+    );
     console.log(c.dim('    二选一：'));
     console.log(c.dim(`      1. ${c.bold('npm run passwd')}  生成账号，把输出粘进 moments.config.mjs → auth.users`));
-    console.log(c.dim(`      2. 把 moments.config.mjs 里的 ${c.bold('auth.enabled')} 改成 false（谁都能传）`));
+    console.log(c.dim(`      2. 把 moments.config.mjs 里的 ${c.bold('auth.enabled')} 改成 false（谁都能看、谁都能传）`));
     console.log('');
   }
 
@@ -228,8 +234,10 @@ async function cmdBuild(args) {
   await fsp.cp(path.join(ROOT, 'public'), outDir, { recursive: true });
 
   // 1b. 站点配置注入（跟 serve 时同一套占位替换）
-  //     静态产物没有后端，上传能力必须显式关掉，否则页面上的发布按钮点下去只会报错
-  const cfgJson = toScriptJson(siteConfig(config, { uploadEnabled: false }));
+  //     静态产物没有后端，上传能力必须显式关掉，否则页面上的发布按钮点下去只会报错。
+  //     readScope 同理写死成 'upload'（= 读侧不设限）：产物里没有任何鉴权，
+  //     若把配置里的 'latest' / 'all' 照搬进去，页面会以为该弹登录框，而后端根本不存在。
+  const cfgJson = toScriptJson(siteConfig(config, { uploadEnabled: false, readScope: 'upload' }));
   const indexPath = path.join(outDir, 'index.html');
   await fsp.writeFile(
     indexPath,
@@ -308,6 +316,21 @@ async function cmdBuild(args) {
     console.log(c.dim('  要连原图一起带走（可离线打开）加 --copy-media。'));
   }
   if (base) console.log(c.dim(`  部署前缀：${base}`));
+
+  // 静态产物没有后端，auth.scope 三档全都不生效 —— 产物是全员可看的。
+  // 不把这句说出来的话，很容易误以为"配了 scope 就等于上了锁"，然后把 dist 丢出去。
+  const { scope: readScope } = resolveReadScope(config.auth || {});
+  if (readScope !== 'upload') {
+    console.log('');
+    console.log(c.yellow('  ! 静态产物里没有任何鉴权 —— 照片对拿到地址的人都是可看的'));
+    console.log(
+      c.dim(
+        `    配置里的 auth.scope = '${readScope}' 只在 npm start 的本地服务下生效；\n` +
+          `    这里导出的是一堆静态文件，谁拿到就能看谁就能下载。\n` +
+          `    要分享给家人又不想公开，用 npm start（可加 host: '0.0.0.0' 让局域网可访问），别用 dist。`,
+      ),
+    );
+  }
   console.log(c.dim(`\n  本地验证：npx serve ${path.relative(ROOT, outDir) || '.'}\n`));
 }
 

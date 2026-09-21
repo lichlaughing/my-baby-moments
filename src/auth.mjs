@@ -9,14 +9,20 @@
  *      签名密钥首次启动自动生成到 <cacheDir>/session.key（0600），不进 git。
  *   4. 登录失败按「IP」和「IP+账号」双维度限流，挡住脚本猜口令。
  *      账号不存在时也照样跑一次 scrypt，避免用响应时间探测「这个账号存不存在」。
+ *   5. 拦哪一侧由 auth.scope 决定：默认连「看」也拦（未登录只见最新几条），
+ *      裁剪动作**在服务端完成** —— 未登录时 /api/feed 里根本没有那些数据，
+ *      对应媒体的 URL 直接回 401。前端隐藏不算数，抓包就能绕过。
  *
- * 三条与安全直接相关的取舍，写在前面免得以后被"优化"掉：
+ * 四条与安全直接相关的取舍，写在前面免得以后被"优化"掉：
  *
  *   · Cookie 默认不带 Secure —— 服务是 http://127.0.0.1，带上 Secure 浏览器直接不保存，
  *     等于登录永远失败。放到 HTTPS 反代后面时，靠 x-forwarded-proto 或配置显式打开。
  *   · 时间比较一律 timingSafeEqual（先 sha256 对齐长度），不用 ===。
- *   · auth.enabled 为真但没有账号时，**不静默放行**，而是把上传挡掉并给明确指引。
- *     静默放行等于"以为上了锁，其实门是开的"，比报错危险得多。
+ *   · auth.enabled 为真但没有账号时，**不静默放行**，而是把请求挡掉并给明确指引。
+ *     静默放行等于"以为上了锁，其实门是开的"，比报错危险得多。scope 越严，挡掉的面越大。
+ *     代价是"开了认证却忘了配账号"时整站都进不去 —— 这是刻意的，启动日志会明说怎么修。
+ *   · scope 写错（拼写错误）时不退回"全开"，而是 warn + 退回默认的 'latest'。
+ *     宁可少看几条，也不能因为一个字母就让整个相册裸奔。
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -40,6 +46,42 @@ export class AuthError extends Error {
     this.status = status;
     Object.assign(this, extra);
   }
+}
+
+/* ─────────────────────────── 读侧范围 ─────────────────────────── */
+
+/** 未登录时能看到什么。只有三档。 */
+export const SCOPES = ['latest', 'all', 'upload'];
+
+/**
+ * 从配置算出读侧的**有效**范围。抽成独立函数是为了让 `npm run build` 也能问同一句话：
+ * 静态产物没有后端，三档全都不生效，构建时必须提醒（否则会以为导出物也上了锁）。
+ *
+ * @returns {{ scope: string, previewCount: number, readLimit: number }} readLimit 为 Infinity 表示不限制
+ */
+export function resolveReadScope(cfg = {}, onWarn = () => {}) {
+  // 关掉认证就是全开：此时 scope 写什么都不该留个半开的门缝
+  if (cfg.enabled === false) return { scope: 'upload', previewCount: 0, readLimit: Infinity };
+
+  const raw = String(cfg.scope ?? 'latest')
+    .trim()
+    .toLowerCase();
+  let scope = raw;
+  if (!SCOPES.includes(raw)) {
+    onWarn(
+      `auth.scope 的值 "${cfg.scope}" 不认识（只认 ${SCOPES.join(' / ')}），已按 'latest' 处理 —— ` +
+        `写错时不会退回"全开"，否则一个拼写错误就等于把整个相册放出去了。`,
+    );
+    scope = 'latest';
+  }
+
+  const n = Number(cfg.previewCount ?? 1);
+  const previewCount = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 1;
+  return {
+    scope,
+    previewCount,
+    readLimit: scope === 'all' ? 0 : scope === 'upload' ? Infinity : previewCount,
+  };
 }
 
 /* ─────────────────────────── 口令哈希 ─────────────────────────── */
@@ -188,8 +230,14 @@ export function createAuth(config, { root, onWarn = () => {} } = {}) {
   const users = normalizeUsers(cfg.users, onWarn);
 
   const enabled = cfg.enabled !== false;
-  /** 配了 auth 却一个账号都没有：不放行，把上传挡掉并说清楚怎么修 */
+  /** 配了 auth 却一个账号都没有：不放行，把请求挡掉并说清楚怎么修 */
   const misconfigured = enabled && users.length === 0;
+
+  /**
+   * 未登录时能看到什么。真正算它的是 resolveReadScope()，
+   * 这里只负责把结果接上（build 那边问的是同一个函数）。
+   */
+  const { scope, previewCount, readLimit } = resolveReadScope(cfg, onWarn);
 
   const sessionMs = Math.max(1, Number(cfg.sessionDays) || 30) * 24 * 3600 * 1000;
   const maxFails = Math.max(3, Number(cfg.maxAttempts) || 8);
@@ -371,12 +419,7 @@ export function createAuth(config, { root, onWarn = () => {} } = {}) {
   async function handleLogin(req, res, json) {
     try {
       if (!enabled) return json(res, 400, { error: '没有开启账号认证（moments.config.mjs → auth.enabled）' });
-      if (misconfigured) {
-        return json(res, 503, {
-          error: '已开启账号认证，但配置里没有任何账号。请在 moments.config.mjs 的 auth.users 里加一个用户。',
-          code: 'AUTH_NOT_CONFIGURED',
-        });
-      }
+      if (misconfigured) return json(res, 503, notConfigured('login'));
 
       const body = await readJsonBody(req);
       const idOrName = String(body.user || '').trim();
@@ -441,23 +484,58 @@ export function createAuth(config, { root, onWarn = () => {} } = {}) {
     return json(res, 200, { ok: true });
   }
 
-  /** GET /api/session 的载荷。刻意不回账号列表：那是"谁有账号"的信息，不该给匿名访客 */
+  /**
+   * GET /api/session 的载荷。刻意不回账号列表：那是"谁有账号"的信息，不该给匿名访客。
+   *
+   * readScope 是**有效值**（关掉认证时恒为 'upload'），前端据此决定：
+   *   'all'    未登录什么都不给看 —— 直接铺一屏登录，连 feed 都不去拉
+   *   'latest' 未登录只给看最新几条 —— 正常渲染，外加一条"登录后看全部"的提示
+   *   'upload' reads 完全放开，只有发布要登录
+   * 前端拿它只是为了少发一个注定 401 的请求；真正的裁剪在服务端，不靠它守。
+   */
   const status = (req) => {
     const user = currentUser(req);
     return {
       ok: true,
       authRequired: enabled,
+      readScope: scope,
       configured: !misconfigured,
       user: user ? { id: user.id, name: user.name } : null,
     };
   };
 
-  function denyUnauthorized(res, json) {
+  /**
+   * 未登录时挡回去。what 决定文案：
+   * 上传和"看照片"是两件事，提示得说清是哪一件，否则用户不知道该去点哪里。
+   */
+  function denyUnauthorized(res, json, what = 'upload') {
     return json(res, 401, {
-      error: '请先登录再上传',
+      error: what === 'read' ? '请先登录再查看照片' : '请先登录再上传',
       code: 'UNAUTHORIZED',
     });
   }
+
+  /**
+   * 配了认证但没账号时统一的 503 响应体，读侧 / 写侧 / 登录页共用 —— 指引只写一遍，
+   * 三处说法不一致时最容易让人以为"是别的问题"。
+   */
+  const notConfigured = (what = 'upload') => ({
+    error:
+      what === 'read'
+        ? '这个站点开了账号认证，但配置里没有任何账号，所以谁也进不来。见 moments.config.mjs → auth.users（可用 npm run passwd 生成）'
+        : what === 'login'
+          ? '已开启账号认证，但配置里没有任何账号。请在 moments.config.mjs 的 auth.users 里加一个用户。'
+          : '服务端还没有配置账号，无法上传。见 moments.config.mjs → auth.users（可用 npm run passwd 生成）',
+    code: 'AUTH_NOT_CONFIGURED',
+  });
+
+  /** 给启动日志用：读侧的一句话说明 */
+  const describeRead = () => {
+    if (!enabled) return '不限（任何人不登录就能看全部）';
+    if (scope === 'upload') return '不限（未登录可看全部，只有发布要登录）';
+    if (scope === 'all') return '未登录什么都看不到（整站要登录）';
+    return `未登录只见最新 ${previewCount} 条，登录后看全部`;
+  };
 
   /** 给启动日志用的一句话说明 */
   const describe = () => {
@@ -469,6 +547,11 @@ export function createAuth(config, { root, onWarn = () => {} } = {}) {
   return {
     enabled,
     misconfigured,
+    scope,
+    readLimit,
+    previewCount,
+    /** 读侧是否被限制（未登录时不能看全部） */
+    readsGated: Number.isFinite(readLimit),
     users: users.map((u) => ({ id: u.id, name: u.name })),
     sessionMs,
     secretFrom,
@@ -481,6 +564,8 @@ export function createAuth(config, { root, onWarn = () => {} } = {}) {
     handleLogout,
     status,
     denyUnauthorized,
+    notConfigured,
     describe,
+    describeRead,
   };
 }

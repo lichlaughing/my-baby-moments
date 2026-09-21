@@ -273,8 +273,9 @@
       </div>
     </div>
 
-    <!-- 登录（本地服务 + 开了账号认证时才用得到）。
-         看照片始终不需要登录，这里只为「往照片库里写」这一步把关。 -->
+    <!-- 登录 / 访问门禁（本地服务 + 开了账号认证时才用得到）。
+         文案由 app.js 按 auth.scope 改写：scope='all' 时它就是整站的门，
+         此时「取消 / 关闭」会被收起来 —— 关掉之后页面是空的，只会让人一脸茫然。 -->
     <div
       class="sheet"
       id="login"
@@ -293,9 +294,7 @@
         </header>
 
         <form class="sheet__body" id="auth-form" novalidate>
-          <p class="auth__lead">
-            看照片不用登录，只有<strong>往照片库里发布</strong>时才需要。
-          </p>
+          <p class="auth__lead" id="auth-lead"></p>
 
           <label class="afield">
             <span class="afield__label">账号</span>

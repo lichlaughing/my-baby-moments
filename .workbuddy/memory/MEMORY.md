@@ -108,6 +108,24 @@
     这条会以「上传链路回归」这个**完全误导**的名义红掉（实测踩过一次，卡了 20 分钟排查方向）。
     ⇒ 期望值一律 `await import` 真实配置后取（`REAL_CONFIG.kids.find(k => k.id === 'k1').name`），
     并让断言标签带上实际值（`宝宝归属正确（k1 = 笑笑）`），失败时一眼看得懂。
+17. 🔴 **读侧鉴权（`auth.scope`）六条不变量**——`resolveReadScope()` 在 `src/auth.mjs` 单独导出，
+    serve 与 build 共问同一句。`'latest'`（默认，`readLimit = previewCount` 默认 1）/
+    `'all'`（`readLimit = 0`）/ `'upload'`（`Infinity`，回到旧行为）。拼错 ⇒ 回 `'latest'` + warn，
+    **绝不回退"全开"**。
+    ① **裁剪在服务端**：被裁条目**不在 `/api/feed` 里**，其媒体在 `/thumb`、`/media` 回 401，
+    `stats` 一并 `restats()` 重算（否则"共 132 条"本身就是泄露）；
+    ② 🔴 `readLimit` 是"给**未登录**的人看多少"⇒ feed 里必须
+    `g.anon ? anonEntries(full.entries) : full.entries`（漏了三元 ⇒ **登录后也只剩 1 条**）；
+    ③ 骨架 `/` 与 `/assets/*` **永远公开**（否则登录界面自己加载不出来），但未登录要
+    `redactKids` 摘掉 `kids[].birthday` / `aliases`；
+    ④ `/api/events`（SSE）**比读接口再严一档**：读侧受限时未登录一律拒连（防侧信道推断作息），
+    单独 `checkEvents()`，不复用 `checkRead()`；
+    ⑤ 未登录可见的缩略图缓存头必须 `private`，不能 `public`；
+    ⑥ 前端 `fetchFeed`：`FEED_DENIED = 401|403|503` ⇒ **绝不**回落 `feed.json`（= 绕过鉴权），
+    而 **404 必须回落**（静态导出没后端）。
+18. 🔴 **base64 末位字符有填充位**：32 字节 HMAC → 43 个 base64url 字符，末位字符只有前 2 位有效，
+    `A`(000000) 与 `B`(000001) 解出的字节**完全相同**。⇒ 测试里"改签名"**不能改末位**
+    （`verify-auth.mjs` 的 `flip` 改首字符），否则约 3% 概率假红，而产品侧比的是解出的字节、容忍它是对的。
 
 ## 本机环境注意
 
@@ -136,10 +154,11 @@
 
 ## 验证基线（改动后请复跑）
 
-- `npm run verify` → `verify:upload` **70** / `verify:auth` **67** / `verify:concurrency` **40** /
-  `build` / `verify:static` **10**，全部 **0 失败**。
-- `npm run verify:ui` → **52 通过 / 0 失败**（真实 Chrome，需非沙箱；**故意不进默认 `verify` 链**）。
+- `npm run verify` → `verify:upload` **70** / `verify:auth` **118** / `verify:concurrency` **40** /
+  `build` / `verify:static` **10**，全部 **0 失败**（合计 **238 / 0**）。
+- `npm run verify:ui` → **86 通过 / 0 失败**（真实 Chrome，需非沙箱；**故意不进默认 `verify` 链**）。
   失败时保留截图到 `.cache/verify-ui/shots/` 而不清理 —— 出问题时截图是最有用的线索。
+  ⚠️ 跑 `verify:ui` 要 `dangerouslyDisableSandbox` + `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`。
 - 并发两条硬读数：分组原子性 **3038 次轮询 0 次半成品**（改造前 1654 轮询 / 503 次半成品）；
   跨进程序号 **1..9 连续唯一**（改造前得到 `1,2,2,3,3,4,5,5,6`）。
 - 各 `verify-*.mjs` 都用自包含的临时工作区（`.cache/verify*/`），开头有安全闸门
