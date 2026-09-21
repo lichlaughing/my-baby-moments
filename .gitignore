@@ -1,0 +1,15 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 运行期缓存：缩略图、扫描元信息、上传暂存区，
+# 以及 .cache/session.key —— 会话签名密钥，泄露等于任何人都能伪造登录。
+# 整个目录都可以安全删除，删了会自动重建（代价只是缩略图重新生成一遍）。
+.cache/
+
+# 编辑器 / 系统噪音
+.DS_Store
+*.log
+
+# photos/ 是内容本身，故意不忽略 —— 想用自己的照片库，
+# 就把 moments.config.mjs 的 paths.mediaRoot 指到别处，或删掉示例目录。

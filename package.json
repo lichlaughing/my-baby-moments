@@ -1,0 +1,30 @@
+{
+  "name": "my-baby-moments",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "宝宝成长记录 - 朋友圈式的家庭影像时间线。按 yyyy-MM-dd 目录自动整理照片与视频。",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/cli.mjs serve",
+    "dev": "node src/cli.mjs serve --open",
+    "seed": "node scripts/seed-demo.mjs",
+    "scan": "node src/cli.mjs scan",
+    "prewarm": "node src/cli.mjs scan --thumbs",
+    "build": "node src/cli.mjs build",
+    "clean": "node src/cli.mjs clean",
+    "passwd": "node src/cli.mjs passwd",
+    "verify": "npm run verify:upload && npm run verify:auth && npm run verify:concurrency && npm run build && npm run verify:static",
+    "verify:upload": "node --expose-gc scripts/verify-upload.mjs",
+    "verify:auth": "node scripts/verify-auth.mjs",
+    "verify:concurrency": "node scripts/verify-concurrency.mjs",
+    "verify:static": "node scripts/verify-static.mjs",
+    "verify:ui": "node scripts/verify-ui.mjs"
+  },
+  "dependencies": {
+    "heic-convert": "^2.1.0",
+    "sharp": "^0.34.2"
+  }
+}
