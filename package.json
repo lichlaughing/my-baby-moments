@@ -16,6 +16,7 @@
     "build": "node src/cli.mjs build",
     "clean": "node src/cli.mjs clean",
     "passwd": "node src/cli.mjs passwd",
+    "doctor": "node scripts/preflight.mjs",
     "verify": "npm run verify:upload && npm run verify:auth && npm run verify:concurrency && npm run build && npm run verify:static",
     "verify:upload": "node --expose-gc scripts/verify-upload.mjs",
     "verify:auth": "node scripts/verify-auth.mjs",

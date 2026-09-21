@@ -1,0 +1,63 @@
+# 部署到 NAS 的推荐姿势。在仓库目录里执行：
+#
+#   mkdir -p /volume1/docker/baby-moments/data
+#   docker compose up -d --build
+#
+# 部署前先跑一次自检（它会实测跨挂载点的 rename、ffmpeg、账号配置等）：
+#   docker compose run --rm baby-moments node scripts/preflight.mjs
+#
+# 可选的 .env（放在本文件旁边，会自动读取）：
+#   DATA_DIR=/volume1/docker/baby-moments/data
+#   PUID=1026
+#   PGID=100
+#   PORT=4310
+
+services:
+  baby-moments:
+    build: .
+    image: my-baby-moments:latest
+    container_name: baby-moments
+    restart: unless-stopped
+    # 让容器里的 PID 1 有个正经的 init：node 收 SIGTERM 会优雅退出
+    # （cli.mjs 里注册了 SIGINT/SIGTERM），init 负责回收 ffmpeg 之类的子进程。
+    init: true
+    ports:
+      - "${PORT:-4310}:4310"
+    environment:
+      # 时间在"日期目录名"和上传的默认日期里都会用到，固定住免得出一小时级别的偏差
+      TZ: Asia/Shanghai
+    # 以谁的身份写文件。填错的表现是：照片能在 DSM 里看到但改不了、删不掉，
+    # 因为你成了 root 或者干脆没权限。ssh 登录 NAS 后 `id` 看自己的 uid/gid；
+    # 也可以 `ls -ln /volume1/docker/baby-moments/data` 看现有文件归谁。
+    user: "${PUID:-1026}:${PGID:-100}"
+    volumes:
+      # ── 一个挂载点，里面同时放照片库和缓存 ──────────────────────────
+      # 别拆成两个 -v（例如 -v /volume1/photos:/data/photos 配
+      # -v /volume1/docker/cache:/data/cache）。Linux 的 rename(2) 是**按挂载点**
+      # 判断能不能原子的，不是按设备：同一块硬盘、同一个文件系统，只要挂载点不同，
+      # 就返回 EXDEV —— 于是 src/upload.mjs 的 commitDir() 会走
+      # `fsp.cp(recursive)` 那条回退，目标目录**逐步出现**。
+      # 原子性一旦丢掉，一批照片上传到一半时，正好刷新的读者会看到"只有一半文件"的动态。
+      # 挂成一个 /data，photos/ 与 cache/ 都是它的子目录，就永远在同一个挂载点上。
+      # （顺带一提：这也让 cacheDir 里的上传锁与暂存区落在真实文件系统上，
+      #   mkdir 的原子性成立，跨进程锁才是可靠的。）
+      - ${DATA_DIR:-/volume1/docker/baby-moments/data}:/data
+      # ── 配置挂在运行期 ────────────────────────────────────────────
+      # 好处：① 口令哈希不进镜像，镜像可以随便传给家人/推到私有 registry；
+      #       ② 改完配置 `docker compose restart` 就生效。
+      # ⚠️ 这个文件必须**先存在**。宿主机路径不存在时 Docker 会建一个空目录顶上去，
+      #    于是容器里 /app/moments.config.mjs 成了目录，启动报错会很迷惑。
+      - ./moments.config.mjs:/app/moments.config.mjs:ro
+    healthcheck:
+      # 打首页骨架：它永远匿名可读（这是设计上就公开的，否则登录界面自己都加载不出来）。
+      # 不要拿 /api/feed 当探针 —— auth.scope 为 'all' 时它匿名返回 401，
+      # 健康检查会红，但服务其实完全正常。
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4310/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

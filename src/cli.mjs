@@ -90,7 +90,8 @@ const openBrowser = (url) => {
 async function cmdServe(args) {
   const config = await loadConfig(args);
   const app = createServer(config, { root: ROOT });
-  app.startWatch();
+  // 注意：故意**不在这里** startWatch()。放到 banner 之后再启动，
+  // 这样"监听建不起来"的提示才会出现在标题下面，而不是先甩一行警告再打印标题。
 
   const { port, host } = config.server;
   await new Promise((resolve, reject) => {
@@ -107,6 +108,10 @@ async function cmdServe(args) {
   console.log(`  ${c.dim('访问范围')} ${app.auth.describeRead()}`);
   console.log(`  ${c.dim('上传账号')} ${app.auth.describe()}`);
   console.log('');
+
+  // 放到 banner 之后再建监听：网络盘 / 网盘挂载点上 FSEvents 通常不可用，
+  // 建不起来时 server 会 warn 一行 —— 那行应该出现在这里，而不是标题之前。
+  app.startWatch();
 
   // 开了认证却没配账号时，请求会被挡住。这是刻意为之（静默放行更危险），
   // 所以必须把"怎么修"当场说清楚，别让人去翻源码。
@@ -132,7 +137,15 @@ async function cmdServe(args) {
     console.log(c.dim(`  按下面的结构放照片，页面会自动刷新：\n`));
     console.log(c.dim(`    photos/2026-09-20/001-第一次翻身/001.jpg\n`));
   }
-  if (config.server.watch) console.log(c.dim('  监听中：往照片目录丢文件，页面会自动更新\n'));
+  if (config.server.watch) {
+    // 只在监听**真的**建起来了才说"会自动更新"。网络盘上 fs.watch 会失败，
+    // 那时上面已经提示过一次了，这里再说一句"自动更新"就是自相矛盾。
+    console.log(
+      app.watchActive()
+        ? c.dim('  监听中：往照片目录丢文件，页面会自动更新\n')
+        : c.dim('  未监听：改动照片后手动刷新页面\n'),
+    );
+  }
 
   if (args.open) openBrowser(url);
 

@@ -126,6 +126,44 @@
 18. 🔴 **base64 末位字符有填充位**：32 字节 HMAC → 43 个 base64url 字符，末位字符只有前 2 位有效，
     `A`(000000) 与 `B`(000001) 解出的字节**完全相同**。⇒ 测试里"改签名"**不能改末位**
     （`verify-auth.mjs` 的 `flip` 改首字符），否则约 3% 概率假红，而产品侧比的是解出的字节、容忍它是对的。
+19. **照片库可以放在本机之外的挂载点（NAS / 网盘）—— 已实测，`paths.mediaRoot` 写绝对路径即可，
+    无需改代码**。实测读数：scan / 上传落盘（md5 与源一致）/ 缩略图 / 原图 / `Range` 206 全正常；
+    跨设备 `rename` 抛 `EXDEV` ⇒ 回退到复制（`isExdev` + `commitDir`）。
+    三条硬约束：
+    ① 🔴 **缩略图缓存（`thumbs.cacheDir`）必须留本地盘**，跟着放网盘会让九宫格慢到不可用；
+    ② 🔴 **`mediaRoot` 与 `cacheDir` 必须在同一个挂载点**：跨挂载点时 `commitDir()` 的 `rename`
+       抛 `EXDEV`、回退 `fsp.cp(recursive)`，目标目录**逐步出现** ⇒ 入库原子性拿不回来
+       （一批上传途中读者可能看到只有一半文件的动态）。
+       Linux 的 `rename(2)` 按**挂载点**判断而非按设备：同一块硬盘、同一个文件系统，两个 `-v`
+       照样 EXDEV（依据：GNU coreutils bug#80060、linux-fsdevel 的 cross-bind-mount rename 讨论）。
+       注意"缓存留本地 + 库在网盘"就是这套组合的**固有代价**，`naming: 'time'` 修不了它（见 ③）。
+    ③ 🔴 **`upload.naming: 'time'` 解决的是"文件锁不可靠"，与入库原子性无关** ——
+       `'order'` 起名要"读已用序号再 +1"，靠 mkdir 目录锁，而网络盘不保证 mkdir 的原子性。
+       这两件事曾被写混在同一句里，已拆开（README 与配置注释同步修正）。
+    ④ `fs.watch` 在网络盘上建不起来 ⇒ **失败必须可见**：`startWatch()` 走 `warn()` 提示一次
+       （`watchWarned` 去重），并暴露 `watchActive()`；`cli.mjs` 里 `startWatch()` 要放在
+       **banner 之后**调用（否则警告甩在标题上面），末行按 `watchActive()` 分流打印
+       「监听中」/「未监听」，**不要无条件说"会自动更新"**（自相矛盾）。
+    🔴 消费级网盘（百度 / 阿里 / 夸克）**设计上禁止外链**，没有稳定公开直链 ⇒ 不能像对象存储那样
+    让 `<img>` 直出，只能经 AList / rclone 转 WebDAV 后挂载。
+
+20. 🔴 **容器化部署到 NAS 的六条**（`Dockerfile` / `docker-compose.yml` / `scripts/preflight.mjs` 已就位）：
+    ① **`server.host` 必须 `'0.0.0.0'`** —— 默认 `127.0.0.1` 在容器里只绑自己的回环，端口映射也不通；
+    ② **数据只挂一个 `/data`**，`photos/` 与 `cache/` 都做它的子目录（原因见第 19 条 ②）；
+    ③ **ffmpeg 是 Linux 上视频缩略图的唯一路径** —— `render()` 里 video 的顺序是 `[ffmpeg, QuickLook]`，
+       而 `renderViaQuickLook()` / `renderViaSips()` 第一行就 `if (!isMac) throw`。
+       不装不报错，只是视频全退化成瓦片（Dockerfile 用 `--build-arg WITH_FFMPEG=0` 可省这 ~300MB）；
+    ④ **`sharp` 是平台相关原生包** ⇒ `node_modules` 不能跨平台复制，镜像里必须自己 `npm ci`
+       （`.dockerignore` 已挡住本机那份）；
+    ⑤ **健康检查打首页 `/`，别打 `/api/feed`** —— `scope='all'` 时它匿名回 401，会把"服务好着呢"报成不健康；
+    ⑥ **反代下限流共用一个 IP 桶**：`limitKeys()` 优先取 `socket.remoteAddress`，反代后面所有客户端同址
+       ⇒ 一人连错 `maxAttempts` 次就锁住所有人。偏严的一侧（比限流失效好），放宽就调大 `maxAttempts` / `windowMinutes`。
+    · 最小运行时文件集 = `src/ + public/ + package.json + moments.config.mjs + node_modules`
+      （`scripts/` 非运行必需，实测过；镜像里带它只为能跑 `npm run doctor` 与验证链）。
+    · `media.ignoreDirs` 本来就含 `@eaDir` / `#recycle`，群晖场景不需要额外配置。
+    · **诊断类脚本的读数必须与应用同口径**：扩展名与忽略规则都要从 `config.media` 读，别硬编码内置表；
+      `role: 'poster'`（与视频同名的图片）不算照片。
+    · ⚠️ **本机没有容器运行时** ⇒ 镜像从未真实构建过。不确定的部分一律做成了 `npm run doctor` 的实测项。
 
 ## 本机环境注意
 
@@ -169,6 +207,16 @@
   它继承真实配置，若不关掉、而使用者恰好没配 `auth.users`，服务会对上传回 503，
   这条用例测的就不再是"上传链路"而是"认证配置"了（这曾是完整验证链抓到的真实回归）。
 - `npm run scan` → 5 天 / 8 条 / 37 照片 / 1 视频。
+- `npm run doctor`（部署前自检，`scripts/preflight.mjs`）→ 真实配置下 **15 通过 / 2 注意 / 0 失败**。
+  它**真的去 rename 一次**来判断 cacheDir 与 mediaRoot 是否同一挂载点，不推断；
+  探针文件以 `.` 开头放照片库顶层（扫描器顶层只认目录，且 `.tmp` 不在扩展名表里）并在 `finally` 删除。
+  已实测过的分支：跨挂载点（内存盘造）报 EXDEV；`container=docker` + `127.0.0.1` 报 ✗；
+  `auth.enabled` 但 `users: []` 报 ✗；配置不存在/有 ✗ 时退出码 1。
+  ⚠️ 它读扩展名与忽略规则**从 `config.media` 取**（与 `scan.mjs` 同源），照片数要排除 `role: 'poster'`，
+  否则读数会与 `npm run scan` 差一个数、看起来像 bug。
+  ⚠️ 沙箱会改写 `err.code`（`CODEBUDDY_BROKER_DENY`）⇒ 脚本里用 `codeOf()` 优先从 message 前缀取真实 errno。
+- 最小运行时文件集（容器镜像的依据）：`src/ + public/ + package.json + moments.config.mjs + node_modules`，
+  实测能起服务并让 `/`、`/assets/*`、`/api/feed` 全 200；`scripts/` 不是运行必需。
 - 视觉审计（`headless-visual-audit`）：亮 1280 与暗 1280 **各 101 个文本节点、各只有 1 项「不达标」**，
   且是同一个**既有假阳性** —— `.topbar__brand` 未吸顶时就是 `opacity: 0`，
   前景与背景因此都合成成 `--canvas`、比值恒为 1（不可见内容不适用对比度要求）。

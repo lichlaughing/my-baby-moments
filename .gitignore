@@ -11,5 +11,9 @@ dist/
 .DS_Store
 *.log
 
+# docker compose 的环境变量（DATA_DIR / PUID / PGID / PORT）。
+# 里面通常没有秘密，但每个人机器上的路径和 uid 都不一样，不进仓库。
+.env
+
 # photos/ 是内容本身，故意不忽略 —— 想用自己的照片库，
 # 就把 moments.config.mjs 的 paths.mediaRoot 指到别处，或删掉示例目录。

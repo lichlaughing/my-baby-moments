@@ -102,14 +102,93 @@ photos/
 | 分组 | 关键项 | 说明 |
 | --- | --- | --- |
 | `site` | `title` `signature` `cover` `avatar` `footer` | 封面留 `null` 会自动用最新一条动态的首图 |
-| `paths` | `mediaRoot` | 照片库根目录，可写绝对路径 |
+| `paths` | `mediaRoot` | 照片库根目录，可写绝对路径（移动硬盘 / NAS / 网盘挂载点都行，见下文） |
 | `kids` | `id` `name` `aliases` `birthday` `avatar` | `birthday` 用于自动算年龄，`aliases` 用于从名字猜归属 |
 | `feed` | `pageSize` `defaultKid` `detectKidFromName` | 滚动到底自动加载下一批 |
 | `media` | `images` `videos` `ignoreDirs` `ignorePrefix` | 扩展名白名单与忽略规则 |
 | `thumbs` | `gridSize` `viewSize` `quality` `concurrency` `cacheDir` | 九宫格 480px 正方裁切 / 大图长边 1600px |
 | `upload` | `enabled` `maxFiles` `maxFileMB` `naming` `lockStaleMs` `lockWaitMs` | 页面右上角「发布」按钮。只在 `npm start` 下有效，静态导出自动隐藏；`enabled: false` 可彻底关掉。`naming` 决定目录名前缀是序号还是时间戳 |
 | `auth` | `enabled` `users` `sessionDays` `maxAttempts` `windowMinutes` `secret` `secure` | 上传（写照片库）要先登录，看照片不需要。先用 `npm run passwd` 生成账号，见下文 |
-| `server` | `port` `host` `watch` | `watch` 打开后，加照片页面会自动刷新 |
+| `server` | `port` `host` `watch` | `host` 设 `'0.0.0.0'` 可供局域网其他设备访问；`watch` 打开后加照片会自动刷新（网络盘上不生效） |
+
+---
+
+## 照片库放哪里：本机 / 移动硬盘 / NAS / 网盘
+
+`paths.mediaRoot` 接受**绝对路径**，所以照片库不必待在项目里。指向一块挂载点即可：
+
+```js
+paths: { mediaRoot: '/Volumes/photos' }        // 移动硬盘、NAS 的 SMB/WebDAV 挂载点都行
+```
+
+这条路是**实测验证过**的（扫描、上传落盘、缩略图、原图与视频 Range 全部正常）。三条要点：
+
+| 要点 | 原因 |
+| --- | --- |
+| 🔴 **缩略图缓存留在本地盘** | 九宫格每个格子都要随机读原图，缓存跟着放网盘会慢到不可用。`thumbs.cacheDir` 保持 `.cache` 即可 |
+| 🟡 **上传会丢掉原子性（这套组合的固有代价）** | 缓存本地 + 照片库在网盘 = 天然跨挂载点，`rename` 返回 `EXDEV`，入库退化成「复制 + 删除」，目标目录**逐步出现** —— 一小段期间读者可能看到只有一半文件的动态。想保住原子性只能让缓存与照片库落在**同一个挂载点**（缓存也放网盘，代价是缩略图变慢） |
+| 🟡 **`server.watch` 建议关掉** | 网络盘（WebDAV / SMB / FUSE）通常不支持文件系统事件：监听可能根本建不起来，也可能建起来了却永远收不到远端改动。两者表现不同，`npm run doctor` 会分别实测 |
+| 🟡 **`upload.naming` 建议改成 `'time'`** | 这是**另一件事**：网络盘上 `mkdir` 的原子性不保证，而 `'order'` 起名要"读出已用序号再 +1"，靠的就是那把目录锁。`'time'` 直接生成不重复的名字，**连锁都不依赖** |
+
+**多设备共用一个库**：每台设备各自挂载同一个网盘目录，各自跑 `npm start`（想跨设备访问就设 `server.host: '0.0.0.0'`）。缩略图缓存是每台设备各自的，属于预期行为。
+
+**两类存储别混淆**：
+
+- **有 WebDAV 的私有网盘 / NAS**（群晖、威联通、Nextcloud、坚果云）—— 直接挂成本地目录即可。macOS 是「前往 → 连接服务器」或系统自带的 `mount_webdav`；也可以让 NAS 直接开 SMB。
+- 🔴 **消费级网盘**（百度、阿里云盘、夸克）**设计上禁止外链**，没有稳定公开直链，**不能**像对象存储那样让图片直出 —— 只能经 AList / rclone 转成 WebDAV 后再挂载。百度网盘限速严重，挂载后读大图体验很差。
+
+---
+
+## 部署到服务端：NAS / 服务器（Docker）
+
+仓库里带了 `Dockerfile` 与 `docker-compose.yml`，为 NAS 设计（群晖 Container Manager、威联通 Container Station 都直接支持 compose），也适用于任何装了 Docker 的机器。
+
+**先自检，再部署。** `npm run doctor` 逐项给**读数**，而不是"应该没问题"：
+
+```bash
+npm run doctor          # 本机 / NAS 上直接跑
+docker compose run --rm baby-moments node scripts/preflight.mjs   # 或在容器里跑
+```
+
+检查项：Node 版本、照片库与缓存的可读写、sharp 能不能真的编出一张 webp、HEIC 能不能真解一张、ffmpeg 在不在、目录监听能不能建起来**且能不能收到事件**，以及最容易被漏掉的一条 —— **缓存与照片库是不是同一个挂载点**（不猜，直接真的 `rename` 一次看 errno）。有 ✗ 时退出码为 1，可以直接塞进部署脚本。
+
+### 三步
+
+| 步骤 | 做法 |
+| --- | --- |
+| 1. 准备数据目录 | `mkdir -p /volume1/docker/baby-moments/data`，照片库就是 `data/photos` |
+| 2. 改配置 | `paths.mediaRoot: '/data/photos'`、`thumbs.cacheDir: '/data/cache'`、**`server.host: '0.0.0.0'`** |
+| 3. 起服务 | `docker compose up -d --build` |
+
+要填 PUID / PGID / 数据目录，在同目录建个 `.env`（`docker compose` 会自动读，已 gitignore）：
+
+```ini
+DATA_DIR=/volume1/docker/baby-moments/data
+PORT=4310
+PUID=1026      # ssh 上去 `id` 看自己的 uid；或 ls -ln data 看现有文件归谁
+PGID=100
+```
+
+### 容器化的四个坑
+
+| # | 坑 | 现象 / 原因 |
+| --- | --- | --- |
+| 🔴 | `server.host` 还是 `127.0.0.1` | 在容器里等于只监听容器自己的回环，**端口映射到外面也连不上**（宿主机 curl 永远 connection refused）。必须 `'0.0.0.0'` |
+| 🔴 | photos 与 cache 挂成了**两个** `-v` | Linux 的 `rename(2)` 按**挂载点**判断，不是按设备：同一块硬盘、同一个文件系统，只要挂载点不同就返回 `EXDEV` —— 入库于是从"原子改名"退化成"复制 + 删除"，上传途中读者可能看到半条动态。挂成一个 `/data`，`photos/` 与 `cache/` 都做它的子目录 |
+| 🔴 | `user:` 没填或填错 | 容器默认以 root 写文件，照片在 DSM 里就改不了、删不掉。用 `PUID:PGID` 指定成你自己 |
+| 🟡 | `auth.secure: true` 但没有 https | 浏览器不保存带 `Secure` 的 Cookie，**登录会永远失败**。保持 `null`（自动，看反代透传的 `x-forwarded-proto`），或真的配上 https 再打开 |
+
+### 反向代理与 HTTPS
+
+群晖「控制面板 → 登录门户 → 反向代理」加一条：来源 `https://照片.example.com:443` → 目标 `http://127.0.0.1:4310`。这样 `auth.secure` 的自动判断才生效。
+
+一条要提前接受的取舍：登录限流按**来源 IP** 分桶，而代码优先取 `socket.remoteAddress` —— 反代后面所有客户端都长一个样，所以**一个人连错 8 次会把所有人一起锁 10 分钟**。这是偏严的一侧（比限流形同虚设好），家里人多想放宽就调大 `maxAttempts` / `windowMinutes`。
+
+### 顺带两件
+
+- ✅ **群晖的 `@eaDir`、回收站 `#recycle` 已经在 `media.ignoreDirs` 里**，不需要额外配置。
+- 🟡 **备份**：`data/photos` 跟数据库一样没得重建，用 NAS 的快照 / Hyper Backup 覆盖；`data/cache` 全是缩略图，丢了自动重建，可以不备。
+- 想在容器里复跑验证链证明镜像本身没问题：`docker compose run --rm baby-moments npm run verify`（`verify:ui` 需要 Chrome，容器里跑不了，属预期）。
 
 ---
 
@@ -124,6 +203,7 @@ photos/
 | `npm run build` | 导出纯静态站点到 `dist/` |
 | `npm run clean` | 清空缩略图缓存（`--all` 连 manifest 一起清） |
 | `npm run passwd` | 生成账号口令哈希，并打印可直接粘贴进 `moments.config.mjs` 的片段 |
+| `npm run doctor` | 部署前自检：Node / 照片库与缓存可读写 / **入库 rename 是否还是原子的** / sharp·HEIC·ffmpeg / 目录监听 / 账号配置。有 ✗ 时退出码 1 |
 | `npm run verify` | 完整自检：上传链路 → 鉴权 → 并发 → 重新构建 → 校验导出物 |
 | `npm run verify:upload` | 只跑上传链路自检（自包含，会在 `.cache/verify/` 下起临时照片库与临时服务，跑完自删） |
 | `npm run verify:auth` | 只跑鉴权自检：Cookie 属性、篡改/伪造/过期、限流、未配账号时挡上传 |
@@ -176,6 +256,7 @@ npm run build -- --base /baby/       # 部署在子路径时用
 
 - `/media/*` 支持 HTTP **Range**（含 `bytes=-N` 后缀形式与 416 处理），视频拖进度条正常。
 - `/api/events` 是 SSE 通道；`watch: true` 时新增照片会推送变更，页面顶部自动刷新或提示"多了 N 条新动态"。
+- ⚠️ **照片库在网络盘 / 网盘挂载点上时，`fs.watch` 通常建不起来**（那类文件系统不提供事件）。这时服务会提示一次、随后退回「手动刷新」，**不会崩** —— 启动日志里的 `监听中 / 未监听` 就是这条状态。
 - 所有媒体路径经 `path.resolve` 前缀校验，越权访问返回 400。
 
 ### 页面发布的落盘链路
@@ -310,6 +391,9 @@ npm run passwd        # 输入昵称和口令（不回显），它会打印一�
 ```
 my-baby-moments/
 ├── moments.config.mjs     ★ 唯一需要编辑的文件
+├── Dockerfile             部署到服务器：Node 22 slim + 可选 ffmpeg，x86_64 / arm64 都能构建
+├── docker-compose.yml      NAS 编排：数据单挂载、PUID/PGID、健康检查
+├── .dockerignore           把照片库与 node_modules 挡在构建上下文之外
 ├── photos/                照片库（结构规范见 photos/README.md）
 ├── src/
 │   ├── util.mjs           零依赖工具（自然排序 / 路径编解码 / 年龄计算 / 前缀解析 / 限流器）
@@ -323,15 +407,16 @@ my-baby-moments/
 ├── public/
 │   ├── index.html         骨架 + 图标雪碧图 + 配置注入点
 │   └── assets/
-│       ├── style.css      CSS 变量 + 组件样式（约 2130 行）
-│       └── app.js         零框架渲染逻辑（约 1730 行）
+│       ├── style.css      CSS 变量 + 组件样式（约 2302 行）
+│       └── app.js         零框架渲染逻辑（约 2004 行）
 └── scripts/
     ├── fetch-icons.mjs        幂等拉取 Phosphor 图标内联进 index.html
     ├── seed-demo.mjs          生成示例照片库
+    ├── preflight.mjs          部署前自检（`npm run doctor`）：实测跨挂载点 rename、解码能力、监听与账号配置
     ├── verify-upload.mjs      上传链路自检（自包含，70 项断言）
-    ├── verify-auth.mjs        鉴权自检（自包含，67 项断言）
+    ├── verify-auth.mjs        鉴权自检（自包含，118 项断言）
     ├── verify-concurrency.mjs 并发与原子性自检（自包含，40 项断言）
-    ├── verify-ui.mjs          登录界面自检（真实 Chrome，52 项断言，需非沙箱）
+    ├── verify-ui.mjs          界面自检（真实 Chrome，86 项断言，需非沙箱）
     └── verify-static.mjs      导出物契约自检（10 项断言）
 ```
 

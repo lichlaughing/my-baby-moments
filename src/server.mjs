@@ -190,19 +190,41 @@ export function createServer(config, { root, onWarn } = {}) {
   }, 400);
 
   let watcher = null;
+  /** 监听建不起来只提醒一次，别每帧刷屏 */
+  let watchWarned = false;
   function startWatch() {
     if (!config.server.watch || watcher) return;
+
+    /**
+     * 放弃监听时给出**可见的信号**。
+     *
+     * 网络盘 / 网盘挂载点（WebDAV、SMB、FUSE）上 inotify / FSEvents 通常不可用，
+     * 于是 fs.watch 抛错或立刻 error。这在以前是完全静默的 —— 用户以为
+     * "往照片目录丢文件页面会自动刷新"，结果等半天没反应，还以为是程序坏了。
+     * 现在至少说清楚：这是挂载点的正常现象，手动刷新即可。
+     */
+    const giveUp = (why) => {
+      try { watcher?.close(); } catch { /* 已经坏了就算了 */ }
+      watcher = null;
+      if (watchWarned) return;
+      watchWarned = true;
+      warn(
+        `照片目录监听没建起来（${why}），页面不会自动刷新。` +
+          `网络盘 / 网盘挂载点通常不支持文件系统事件，属正常现象 —— 改完手动刷新页面即可。` +
+          `想彻底关掉这条提示：把 server.watch 设成 false。`,
+      );
+    };
+
     try {
       watcher = fs.watch(scanner.mediaRoot, { recursive: true }, (_evt, file) => {
         if (file && /(^|\/)\./.test(file)) return;
         onFsChange();
       });
-      watcher.on('error', () => {
-        watcher?.close();
-        watcher = null;
-      });
-    } catch {
-      watcher = null;
+      watcher.on('error', (err) => giveUp(err?.code || err?.message || '未知错误'));
+    } catch (err) {
+      // 注意同时看 code 与 message：本机沙箱会把 code 改写成 CODEBUDDY_BROKER_DENY，
+      // 真正的原因只在 message 里（和 isExists / isExdev 是同一类坑）。
+      giveUp(err?.code || err?.message || '未知错误');
     }
   }
 
@@ -599,6 +621,8 @@ export function createServer(config, { root, onWarn } = {}) {
     invalidate,
     getManifest,
     startWatch,
+    /** 监听是否真的建立起来了。false 且 config.server.watch 为真 = 这个文件系统不支持事件 */
+    watchActive: () => !!watcher,
     closeWatch: () => watcher?.close(),
     stats: () => thumbs.cacheSize(),
   };

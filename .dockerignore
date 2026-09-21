@@ -1,0 +1,22 @@
+# 构建上下文里**绝不能**带上照片和缓存：
+#   · 体积大（照片库动辄几个 GB），每次构建都要往 daemon 传一遍
+#   · 是隐私内容，进镜像等于复制一份到镜像层里，删都删不干净
+#   · 运行期用不到 —— 照片和缓存都靠 volume 挂进来
+photos/
+.cache/
+dist/
+
+# 依赖必须**在镜像里装**：sharp 是平台相关的原生包（预编译 libvips），
+# 把 macOS 上那份 node_modules 拷进 Linux 镜像会报 "Could not load the sharp module"。
+# 这一条也顺带避免了 4 个目录的上下文传输。
+node_modules/
+
+# 配置里有口令哈希，不进镜像 —— 用 compose 挂到 /app/moments.config.mjs
+moments.config.mjs
+
+# 与运行无关
+.git/
+.gitignore
+.workbuddy/
+*.log
+.DS_Store
